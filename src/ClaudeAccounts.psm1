@@ -256,6 +256,9 @@ function claude {
        '-a' hijacked. (An unquoted `--` is consumed by PowerShell itself
        before reaching the wrapper — quote it ('--') when you need to pass it
        through to claude.) #>
+    # Error paths must report message + exit code, never throw — even when the
+    # caller (or a CI runner) sets a global $ErrorActionPreference = 'Stop'.
+    $ErrorActionPreference = 'Continue'
     $explicit = $null
     $i = 0
     while ($i -lt $args.Count) {
@@ -331,6 +334,10 @@ function claude-account {
         [switch]$NoLogin,
         [switch]$Force
     )
+
+    # Error paths must report message + exit code, never throw — even when the
+    # caller (or a CI runner) sets a global $ErrorActionPreference = 'Stop'.
+    $ErrorActionPreference = 'Continue'
 
     $profilesRoot = Join-Path (Get-ClaudeAccountsHome) 'profiles'
 
