@@ -32,6 +32,7 @@
 
 # Hyphenated function names (claude-account) are a parse error in POSIX-mode
 # bash — bail out of the source cleanly instead of spraying rc errors.
+# shellcheck disable=SC2317  # the exit only runs if the file is executed instead of sourced
 case ":${SHELLOPTS:-}:" in
     *:posix:*)
         echo 'claude-accounts: POSIX-mode bash is not supported; skipping load.' >&2
@@ -88,6 +89,7 @@ _ca_trim() {
 
 # Expand a leading ~ in a path read from a .path redirect file.
 _ca_expand_tilde() {
+    # shellcheck disable=SC2088  # the quoted '~/' is matched/stripped literally on purpose
     case "$1" in
         '~') printf '%s\n' "$HOME" ;;
         '~/'*) printf '%s/%s\n' "$HOME" "${1#"~/"}" ;;
@@ -547,6 +549,8 @@ EOF
 # Completions
 # ----------------------------------------------------------------------------
 if [ -n "${ZSH_VERSION:-}" ]; then
+    # shellcheck disable=SC2034,SC2206,SC2296  # zsh-only function: compadd -a reads the
+    # arrays by name and ${(f)...} is zsh expansion syntax; shellcheck parses bash.
     _claude_account_zsh() {
         local -a subcmds accounts
         subcmds=(list add remove use current bind unbind version help)
@@ -571,6 +575,8 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         add-zsh-hook precmd _ca_compdef_hook
     fi
 elif [ -n "${BASH_VERSION:-}" ]; then
+    # shellcheck disable=SC2207  # compgen emits one word per line; the canonical
+    # COMPREPLY idiom is fine here (mapfile does not exist in bash 3.2 on macOS).
     _claude_account_bash() {
         local cur="${COMP_WORDS[COMP_CWORD]}"
         if [ "$COMP_CWORD" -eq 1 ]; then
