@@ -30,6 +30,13 @@ CA_END='# <<< claude-accounts <<<'
 CA_REF="${CLAUDE_ACCOUNTS_INSTALL_REF:-main}"
 CA_URL="${CLAUDE_ACCOUNTS_INSTALL_URL:-https://raw.githubusercontent.com/sppeect/claude-accounts/${CA_REF}/src/claude-accounts.sh}"
 
+# On Windows this installer covers Git Bash / MSYS only. PowerShell and cmd.exe
+# are wired up by install.ps1 instead (it also drops the same claude-accounts.sh).
+case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*) CA_WINDOWS=1 ;;
+    *)                    CA_WINDOWS="" ;;
+esac
+
 ca_download() {
     # $1 = url, $2 = destination file
     if command -v curl >/dev/null 2>&1; then
@@ -126,6 +133,8 @@ $line"
             zsh)  rc_file="${ZDOTDIR:-$HOME}/.zshrc" ;;
             bash) rc_file="$HOME/.bashrc" ;;
         esac
+        # Git Bash sometimes leaves $SHELL unset or non-bash; default to ~/.bashrc.
+        if [ -z "$rc_file" ] && [ -n "$CA_WINDOWS" ]; then rc_file="$HOME/.bashrc"; fi
     fi
 
     rc_updated=""
@@ -173,7 +182,14 @@ $line"
     echo "  2. Create an account:                   claude-account add work"
     echo "  3. Run Claude Code with it:             claude --account work"
     echo "  4. Pin it to a project directory:       claude-account bind work"
-    echo "  5. See all commands:                    claude-account help"
+    echo "  5. Check the install:                   claude-account doctor"
+
+    if [ -n "$CA_WINDOWS" ]; then
+        echo ""
+        echo "Detected Windows (Git Bash / MSYS): this configured Git Bash only."
+        echo "For PowerShell and Command Prompt (cmd) support too, also run the PowerShell installer:"
+        echo "  iwr -useb https://raw.githubusercontent.com/sppeect/claude-accounts/${CA_REF}/install.ps1 | iex"
+    fi
 }
 
 main "$@"

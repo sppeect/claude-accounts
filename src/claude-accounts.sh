@@ -44,11 +44,18 @@ esac
 unalias claude 2>/dev/null || true
 unalias claude-account 2>/dev/null || true
 
-CLAUDE_ACCOUNTS_VERSION="1.0.0"
+CLAUDE_ACCOUNTS_VERSION="1.1.0"
 
 # Literal TAB, materialized once — never embed the raw byte in patterns, where
 # an editor reindent would silently corrupt the parsing.
 _CA_TAB="$(printf '\t')"
+
+# What a profile inherits from another config dir on `add` / `migrate`.
+# Strict allow-list: configuration, tooling and usage content travel; identity
+# and ephemeral state never do, so every profile keeps its own login and caches.
+# Deliberately excluded: .credentials.json and .claude.json (login/identity),
+# *.bak/backups, statsig, ide, daemon, shell-snapshots and the *-cache entries.
+_CA_INHERIT_ITEMS="settings.json keybindings.json CLAUDE.md skills agents commands plugins rules output-styles themes hooks projects todos sessions history.jsonl"
 
 _ca_home() {
     printf '%s\n' "${CLAUDE_ACCOUNTS_HOME:-$HOME/.claude-accounts}"
@@ -62,19 +69,64 @@ _ca_profiles_root() {
     printf '%s/profiles\n' "$(_ca_home)"
 }
 
+_ca_shim_dir() {
+    # Holds the cmd shims (claude.cmd / claude-account.cmd) on Windows. The
+    # executable resolver must never pick a 'claude' from here (it calls back
+    # into the wrapper). Git Bash ignores .cmd in command lookup anyway, so this
+    # is belt-and-suspenders.
+    printf '%s/bin\n' "$(_ca_home)"
+}
+
+# Copy allow-listed config/tooling/usage from $1 (source dir) into $2 (dest dir).
+# Optional $3 overrides the item list. Existing entries in the dest are never
+# overwritten. Prints the names actually copied, one per line. Symlinks are
+# dereferenced (cp -RL) so the profile is self-contained.
+_ca_copy_content() {
+    local src="$1" dst="$2" items="${3:-$_CA_INHERIT_ITEMS}" item
+    [ -d "$src" ] || return 0
+    mkdir -p "$dst"
+    for item in $items; do
+        [ -e "$src/$item" ] || continue
+        [ -e "$dst/$item" ] && continue
+        if cp -RL "$src/$item" "$dst/$item" 2>/dev/null; then
+            printf '%s\n' "$item"
+        else
+            printf '%s\n' "claude-accounts: could not copy '$item' from $src" >&2
+        fi
+    done
+}
+
 # Locate the real claude binary, bypassing this wrapper function.
 # Falls back to the native installer location when PATH does not have it
 # (parity with Get-ClaudeExecutable in the PowerShell implementation).
 _ca_exe() {
-    local found=""
+    local shimdir found
+    shimdir="$(_ca_shim_dir)"
+    # Enumerate every claude on PATH and return the first that is NOT our own cmd
+    # shim, so the wrapper can never resolve to the shim that calls back into it.
     if [ -n "${ZSH_VERSION:-}" ]; then
-        found="$(whence -p claude 2>/dev/null)"
+        # shellcheck disable=SC2296  # ${(f)...} is zsh line-splitting
+        for found in ${(f)"$(whence -ap claude 2>/dev/null)"}; do
+            [ -n "$found" ] || continue
+            case "$found" in "$shimdir"/*) continue ;; esac
+            printf '%s\n' "$found"; return 0
+        done
     else
-        found="$(type -P claude 2>/dev/null)"
+        while IFS= read -r found; do
+            [ -n "$found" ] || continue
+            case "$found" in "$shimdir"/*) continue ;; esac
+            printf '%s\n' "$found"; return 0
+        done <<EOF
+$(type -aP claude 2>/dev/null)
+EOF
     fi
-    if [ -n "$found" ]; then printf '%s\n' "$found"; return 0; fi
-    if [ -x "$HOME/.local/bin/claude" ]; then printf '%s\n' "$HOME/.local/bin/claude"; return 0; fi
-    if [ -x "$HOME/.claude/local/claude" ]; then printf '%s\n' "$HOME/.claude/local/claude"; return 0; fi
+    # Native-installer fallbacks when PATH has no usable claude.
+    for found in \
+        "$HOME/.local/bin/claude" \
+        "$HOME/.local/bin/claude.exe" \
+        "$HOME/.claude/local/claude"; do
+        if [ -x "$found" ]; then printf '%s\n' "$found"; return 0; fi
+    done
     return 1
 }
 
@@ -327,7 +379,7 @@ claude() {
 }
 
 claude-account() {
-    local cmd="${1:-help}" name="${2:-}" custom_path="" no_login="" force=""
+    local cmd="${1:-help}" name="${2:-}" custom_path="" no_login="" force="" minimal="" from=""
     if [ $# -gt 0 ]; then shift; fi
     if [ $# -gt 0 ]; then shift; fi
     while [ $# -gt 0 ]; do
@@ -341,6 +393,16 @@ claude-account() {
                 ;;
             --path=?*) custom_path="${1#--path=}"; shift ;;
             --path=) printf '%s\n' "claude-accounts: --path requires a value" >&2; return 1 ;;
+            --from)
+                if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+                    printf '%s\n' "claude-accounts: --from requires a value" >&2
+                    return 1
+                fi
+                from="$2"; shift 2
+                ;;
+            --from=?*) from="${1#--from=}"; shift ;;
+            --from=) printf '%s\n' "claude-accounts: --from requires a value" >&2; return 1 ;;
+            --minimal) minimal=1; shift ;;
             --no-login) no_login=1; shift ;;
             --force|-f) force=1; shift ;;
             *) printf '%s\n' "claude-accounts: unknown option '$1'" >&2; return 1 ;;
@@ -403,12 +465,17 @@ claude-account() {
                 mkdir -p "$dir"
             fi
 
-            # Inherit preferences (permissions, theme, statusline) from default.
-            if [ -f "$(_ca_default_dir)/settings.json" ] && [ ! -f "$dir/settings.json" ]; then
-                cp "$(_ca_default_dir)/settings.json" "$dir/settings.json"
-            fi
+            # Inherit from the default profile so a new account starts with the
+            # same tools and preferences. --minimal copies only settings.json;
+            # the full set never includes credentials (the profile logs in on
+            # its own), which is what keeps the accounts separate.
+            local inherit_items="$_CA_INHERIT_ITEMS" copied
+            [ -n "$minimal" ] && inherit_items="settings.json"
+            copied="$(_ca_copy_content "$(_ca_default_dir)" "$dir" "$inherit_items" | tr '\n' ' ')"
+            copied="$(_ca_trim "$copied")"
 
             printf '%s\n' "Account '$name' created at $dir"
+            [ -n "$copied" ] && printf '%s\n' "Inherited from default: ${copied// /, }"
             if [ -n "$no_login" ]; then
                 printf '%s\n' "To authenticate later: claude --account $name  (login will be requested on first run)"
                 return 0
@@ -518,6 +585,80 @@ claude-account() {
             fi
             ;;
 
+        migrate)
+            if [ -z "$name" ]; then printf '%s\n' "usage: claude-account migrate <name> [--from <name>]   (copies tools/content into a profile; default source is the default account)" >&2; return 1; fi
+            if [ "$name" = "default" ]; then printf '%s\n' "claude-accounts: cannot migrate INTO 'default'. Choose a profile as the destination." >&2; return 1; fi
+            if ! _ca_known "$name"; then
+                printf '%s\n' "claude-accounts: account '$name' does not exist. Create it first with: claude-account add $name" >&2
+                return 1
+            fi
+            local from_name="default" src_dir dst_dir copied
+            [ -n "$from" ] && from_name="$from"
+            if ! _ca_known "$from_name"; then
+                printf '%s\n' "claude-accounts: source account '$from_name' does not exist. Accounts: $(_ca_names | tr '\n' ' ')" >&2
+                return 1
+            fi
+            if [ "$from_name" = "$name" ]; then printf '%s\n' "claude-accounts: source and destination are the same ('$name')." >&2; return 1; fi
+            src_dir="$(_ca_dir_for "$from_name")"
+            dst_dir="$(_ca_dir_for "$name")"
+            printf '%s\n' "Migrating tools and content from '$from_name' into '$name'..."
+            copied="$(_ca_copy_content "$src_dir" "$dst_dir" | tr '\n' ' ')"
+            copied="$(_ca_trim "$copied")"
+            if [ -n "$copied" ]; then
+                printf '%s\n' "Copied into '$name': ${copied// /, }"
+            else
+                printf '%s\n' "Nothing to copy — '$name' already has those items (existing data is never overwritten)."
+            fi
+            printf '%s\n' "Login and caches were not touched; '$name' keeps its own credentials."
+            ;;
+
+        doctor)
+            local d_exe d_resolved d_name d_dir d_src shimdir rc rc_hit
+            shimdir="$(_ca_shim_dir)"
+            printf '\n%s\n\n' "claude-accounts doctor  (v$CLAUDE_ACCOUNTS_VERSION)"
+            printf '%s\n' "Paths"
+            printf '  %-9s: %s\n' "Home" "$(_ca_home)"
+            printf '  %-9s: %s\n' "Profiles" "$(_ca_profiles_root)"
+            printf '  %-9s: %s\n' "Shim dir" "$shimdir"
+            printf '  %-9s: %s\n\n' "Default" "$(_ca_default_dir)"
+            printf '%s\n' "claude binary"
+            if d_exe="$(_ca_exe)"; then
+                printf '%s\n\n' "  [ok] real claude: $d_exe"
+            else
+                printf '%s\n\n' "  [!!] claude binary not found on PATH. Install Claude Code."
+            fi
+            printf '%s\n' "Effective account (this shell, this directory)"
+            d_resolved="$(_ca_resolve "" 2>/dev/null)"
+            d_name="$(printf '%s' "$d_resolved" | cut -f1)"
+            d_dir="$(printf '%s' "$d_resolved" | cut -f2)"
+            d_src="$(printf '%s' "$d_resolved" | cut -f3)"
+            printf '%s\n' "  Account   : $d_name"
+            printf '%s\n' "  Directory : $d_dir"
+            printf '%s\n' "  Source    : $d_src"
+            if [ "$d_name" = "default" ]; then
+                printf '%s\n' "  [i] You are on the DEFAULT account: new skills/agents/plugins/logins land in"
+                printf '%s\n' "      $(_ca_default_dir) - not in a profile."
+                printf '%s\n' "      Use: claude --account <name>   (or: claude-account bind <name>)"
+            fi
+            printf '\n%s\n' "Shell integrations"
+            rc_hit=""
+            for rc in "$HOME/.bashrc" "${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.zshrc" "$HOME/.bash_profile"; do
+                [ -f "$rc" ] || continue
+                if grep -q "claude-accounts" "$rc" 2>/dev/null; then rc_hit="$rc"; break; fi
+            done
+            if [ -n "$rc_hit" ]; then
+                printf '%s\n' "  [ok] shell rc sources the script ($rc_hit)"
+            else
+                printf '%s\n' "  [!] no claude-accounts block in your shell rc (run install.sh)"
+            fi
+            if [ -f "$shimdir/claude.cmd" ]; then
+                printf '%s\n' "  [ok] cmd shims present ($shimdir)"
+            else
+                printf '%s\n' "  [i] cmd shims not installed (Windows-only; run install.ps1 for cmd support)"
+            fi
+            printf '\n'
+            ;;
+
         version)
             printf '%s\n' "claude-accounts $CLAUDE_ACCOUNTS_VERSION (https://github.com/sppeect/claude-accounts)"
             ;;
@@ -528,12 +669,15 @@ claude-account() {
 claude-account — Claude Code account profiles (AWS CLI style)
 
   claude-account list              list accounts and who is logged into each
-  claude-account add <name>        create an account and open the browser login
+  claude-account add <name>        create an account (inherits tools from default) and log in
+  claude-account add <name> --minimal    inherit only settings.json (no skills/agents/content)
   claude-account add <name> --no-login   create without logging in (login on first run)
   claude-account remove <name> [--force] delete a profile (--force when it has login data)
   claude-account use <name>        pin the account to this terminal (use default to undo)
   claude-account bind <name>       bind the current directory to an account (.claude-account)
   claude-account unbind            remove the current directory binding
+  claude-account migrate <name> [--from <name>]  copy tools/content from default (or --from) into a profile
+  claude-account doctor            check the install across the shell, cmd and Git Bash
   claude-account current           show the effective account and where it came from
 
   claude --account <name> [...]    run Claude Code with the chosen account
@@ -553,7 +697,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
     # arrays by name and ${(f)...} is zsh expansion syntax; shellcheck parses bash.
     _claude_account_zsh() {
         local -a subcmds accounts
-        subcmds=(list add remove use current bind unbind version help)
+        subcmds=(list add remove use current bind unbind migrate doctor version help)
         if (( CURRENT == 2 )); then
             compadd -a subcmds
         elif (( CURRENT == 3 )); then
@@ -580,7 +724,7 @@ elif [ -n "${BASH_VERSION:-}" ]; then
     _claude_account_bash() {
         local cur="${COMP_WORDS[COMP_CWORD]}"
         if [ "$COMP_CWORD" -eq 1 ]; then
-            COMPREPLY=($(compgen -W "list add remove use current bind unbind version help" -- "$cur"))
+            COMPREPLY=($(compgen -W "list add remove use current bind unbind migrate doctor version help" -- "$cur"))
         elif [ "$COMP_CWORD" -eq 2 ]; then
             COMPREPLY=($(compgen -W "$(_ca_names 2>/dev/null | tr '\n' ' ')" -- "$cur"))
         fi

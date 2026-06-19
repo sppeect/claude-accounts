@@ -34,7 +34,7 @@
 # CLAUDE_CONFIG_DIR persistently in the session and is inherited by children.
 # ============================================================================
 
-$script:Version = '1.0.0'
+$script:Version = '1.1.0'
 
 function Get-ClaudeAccountsHome {
     if ($env:CLAUDE_ACCOUNTS_HOME) { return $env:CLAUDE_ACCOUNTS_HOME }
@@ -46,7 +46,54 @@ function Get-ClaudeDefaultDir {
     return (Join-Path $env:USERPROFILE '.claude')
 }
 
+function Get-ClaudeShimDir {
+    # Directory that holds the cmd shims (claude.cmd / claude-account.cmd). They
+    # delegate back into this module, so the executable resolver must never pick
+    # a 'claude' found here or it would invoke itself forever.
+    return (Join-Path (Get-ClaudeAccountsHome) 'bin')
+}
+
 $script:MarkerFileName = '.claude-account'
+
+# What a profile inherits from another config dir on `add` / `migrate`.
+# Strict allow-list: configuration, tooling and usage content travel; identity
+# and ephemeral state never do, so every profile keeps its own login and caches.
+# Deliberately excluded: .credentials.json and .claude.json (login/identity),
+# *.bak/backups, statsig, ide, daemon, shell-snapshots and the *-cache entries.
+$script:InheritItems = @(
+    'settings.json', 'keybindings.json', 'CLAUDE.md',
+    'skills', 'agents', 'commands', 'plugins', 'rules', 'output-styles', 'themes', 'hooks',
+    'projects', 'todos', 'sessions', 'history.jsonl'
+)
+
+function Copy-ClaudeProfileContent {
+    <# Copies the allow-listed configuration/tooling/usage content from a source
+       config dir into a destination profile dir. Existing entries in the
+       destination are never overwritten. Returns the list of items copied. #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination,
+        [string[]]$Items = $script:InheritItems
+    )
+    $copied = @()
+    if (-not (Test-Path -LiteralPath $Source -PathType Container)) { return $copied }
+    if (-not (Test-Path -LiteralPath $Destination -PathType Container)) {
+        New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    }
+    foreach ($item in $Items) {
+        $src = Join-Path $Source $item
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        $dst = Join-Path $Destination $item
+        if (Test-Path -LiteralPath $dst) { continue }   # never clobber the profile's own data
+        try {
+            Copy-Item -LiteralPath $src -Destination $dst -Recurse -Force -ErrorAction Stop
+            $copied += $item
+        } catch {
+            Write-Warning "Could not copy '$item' from '$Source': $($_.Exception.Message)"
+        }
+    }
+    return $copied
+}
 
 function Get-ClaudeAccounts {
     <# Returns an ordered dictionary name -> config directory.
@@ -189,13 +236,22 @@ function Get-ClaudeAccountEmail {
 }
 
 function Get-ClaudeExecutable {
-    $exe = Get-Command 'claude' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $exe) {
-        $fallback = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
-        if (Test-Path -LiteralPath $fallback) { return $fallback }
-        return $null
+    # Resolve the real claude binary, skipping our own cmd shim. The shim dir is
+    # first on PATH (so `claude` in cmd hits the wrapper), which means
+    # Get-Command would otherwise return claude.cmd and the wrapper would call
+    # itself. Walk every candidate and take the first one outside the shim dir.
+    $shimDir = (Get-ClaudeShimDir).TrimEnd('\', '/')
+    foreach ($cmd in (Get-Command 'claude' -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $src = $cmd.Source
+        if (-not $src) { continue }
+        $parent = (Split-Path -Parent $src)
+        if ($parent) { $parent = $parent.TrimEnd('\', '/') }
+        if ($parent -and $parent -ieq $shimDir) { continue }   # never resolve to our own shim
+        return $src
     }
-    return $exe.Source
+    $fallback = Join-Path $env:USERPROFILE '.local\bin\claude.exe'
+    if (Test-Path -LiteralPath $fallback) { return $fallback }
+    return $null
 }
 
 function Invoke-ClaudeWithConfigDir {
@@ -319,7 +375,7 @@ function claude-account {
         [Parameter(Position = 0)]
         [ArgumentCompleter({
             param($commandName, $parameterName, $wordToComplete)
-            'list', 'add', 'remove', 'use', 'current', 'bind', 'unbind', 'version', 'help' | Where-Object { $_ -like "$wordToComplete*" }
+            'list', 'add', 'remove', 'use', 'current', 'bind', 'unbind', 'migrate', 'doctor', 'version', 'help' | Where-Object { $_ -like "$wordToComplete*" }
         })]
         [string]$Command = 'help',
 
@@ -331,7 +387,9 @@ function claude-account {
         [string]$Name,
 
         [string]$Path,
+        [string]$From,
         [switch]$NoLogin,
+        [switch]$Minimal,
         [switch]$Force
     )
 
@@ -395,14 +453,18 @@ function claude-account {
                 New-Item -ItemType Directory -Path $dir -Force | Out-Null
             }
 
-            # Inherit preferences (permissions, theme, statusline) from default.
-            $defaultSettings = Join-Path (Get-ClaudeDefaultDir) 'settings.json'
-            $newSettings     = Join-Path $dir 'settings.json'
-            if ((Test-Path -LiteralPath $defaultSettings -PathType Leaf) -and -not (Test-Path -LiteralPath $newSettings)) {
-                Copy-Item -LiteralPath $defaultSettings -Destination $newSettings
-            }
+            # Inherit from the default profile so a new account starts with the
+            # same tools and preferences. -Minimal copies only settings.json;
+            # the full set never includes credentials (the profile logs in on
+            # its own). The login files below are why each account stays separate.
+            $inherit = $script:InheritItems
+            if ($Minimal) { $inherit = @('settings.json') }
+            $copied = Copy-ClaudeProfileContent -Source (Get-ClaudeDefaultDir) -Destination $dir -Items $inherit
 
             Write-Host "Account '$Name' created at $dir" -ForegroundColor Green
+            if ($copied.Count -gt 0) {
+                Write-Host "Inherited from default: $($copied -join ', ')" -ForegroundColor DarkGray
+            }
 
             if ($NoLogin) {
                 Write-Host "To authenticate later: claude --account $Name  (login will be requested on first run)"
@@ -534,6 +596,101 @@ function claude-account {
             }
         }
 
+        'migrate' {
+            if (-not $Name) { $global:LASTEXITCODE = 1; Write-Error 'Usage: claude-account migrate <name> [-From <name>]   (copies tools/content into a profile; default source is the default account)'; return }
+            $accounts = Get-ClaudeAccounts
+            if ($Name -eq 'default') { $global:LASTEXITCODE = 1; Write-Error "Cannot migrate INTO 'default'. Choose a profile as the destination."; return }
+            if (-not $accounts.Contains($Name)) {
+                $global:LASTEXITCODE = 1
+                Write-Error "Account '$Name' does not exist. Create it first with: claude-account add $Name"
+                return
+            }
+            $fromName = 'default'
+            if ($From) { $fromName = $From }
+            if (-not $accounts.Contains($fromName)) {
+                $global:LASTEXITCODE = 1
+                Write-Error "Source account '$fromName' does not exist. Accounts: $($accounts.Keys -join ', ')"
+                return
+            }
+            if ($fromName -eq $Name) { $global:LASTEXITCODE = 1; Write-Error "Source and destination are the same ('$Name')."; return }
+            $srcDir = Get-ClaudeDefaultDir
+            if ($fromName -ne 'default') { $srcDir = $accounts[$fromName] }
+            $dstDir = $accounts[$Name]
+            Write-Host "Migrating tools and content from '$fromName' into '$Name'..."
+            $copied = Copy-ClaudeProfileContent -Source $srcDir -Destination $dstDir
+            if ($copied.Count -gt 0) {
+                Write-Host "Copied into '$Name': $($copied -join ', ')" -ForegroundColor Green
+            } else {
+                Write-Host "Nothing to copy — '$Name' already has those items (existing data is never overwritten)." -ForegroundColor Yellow
+            }
+            Write-Host "Login and caches were not touched; '$Name' keeps its own credentials." -ForegroundColor DarkGray
+        }
+
+        'doctor' {
+            $caHome   = Get-ClaudeAccountsHome
+            $shimDir  = Get-ClaudeShimDir
+            $exe      = Get-ClaudeExecutable
+            $account  = $null
+            try { $account = Resolve-ClaudeAccount } catch {}
+
+            Write-Host ''
+            Write-Host "claude-accounts doctor  (v$script:Version)" -ForegroundColor Cyan
+            Write-Host ''
+            Write-Host 'Paths'
+            Write-Host "  Home      : $caHome"
+            Write-Host "  Profiles  : $profilesRoot"
+            Write-Host "  Shim dir  : $shimDir"
+            Write-Host "  Default   : $(Get-ClaudeDefaultDir)"
+            Write-Host ''
+            Write-Host 'claude binary'
+            if ($exe) { Write-Host "  [ok] real claude: $exe" -ForegroundColor Green }
+            else { Write-Host '  [!!] claude executable not found on PATH. Install Claude Code.' -ForegroundColor Red }
+            Write-Host ''
+            Write-Host 'Effective account (this shell, this directory)'
+            if ($account) {
+                $dir = $account.Dir; if (-not $dir) { $dir = Get-ClaudeDefaultDir }
+                Write-Host "  Account   : $($account.Name)"
+                Write-Host "  Directory : $dir"
+                Write-Host "  Source    : $($account.Source)"
+                if ($account.Name -eq 'default') {
+                    Write-Host '  [i] You are on the DEFAULT account: skills/agents/plugins/logins created now land in' -ForegroundColor Yellow
+                    Write-Host "      $(Get-ClaudeDefaultDir), not in a profile. Use 'claude --account <name>' or 'claude-account bind <name>'." -ForegroundColor Yellow
+                }
+            } else {
+                Write-Host '  [!!] could not resolve the account.' -ForegroundColor Red
+            }
+            Write-Host ''
+            Write-Host 'Shell integrations'
+            $psOk = $false
+            foreach ($p in @($PROFILE.CurrentUserAllHosts, $PROFILE.CurrentUserCurrentHost)) {
+                if ($p -and (Test-Path -LiteralPath $p -PathType Leaf) -and
+                    (Select-String -LiteralPath $p -Pattern 'claude-accounts' -Quiet -ErrorAction SilentlyContinue)) { $psOk = $true; break }
+            }
+            if ($psOk) { Write-Host '  [ok] PowerShell profile imports the module' -ForegroundColor Green }
+            else { Write-Host '  [!] PowerShell profile has no claude-accounts block (run install.ps1)' -ForegroundColor Yellow }
+
+            $shimPresent = Test-Path -LiteralPath (Join-Path $shimDir 'claude.cmd') -PathType Leaf
+            $userPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
+            $inPath = $false
+            if ($userPath) {
+                foreach ($p in ($userPath -split ';')) {
+                    if ($p -and ($p.TrimEnd('\', '/') -ieq $shimDir.TrimEnd('\', '/'))) { $inPath = $true; break }
+                }
+            }
+            if ($shimPresent -and $inPath) { Write-Host '  [ok] cmd shims installed and on PATH' -ForegroundColor Green }
+            elseif ($shimPresent) { Write-Host '  [!] cmd shims exist but the shim dir is not on your User PATH (run install.ps1)' -ForegroundColor Yellow }
+            else { Write-Host '  [!] cmd shims not installed (run install.ps1) - cmd.exe bypasses the wrapper' -ForegroundColor Yellow }
+
+            $bashrc = Join-Path $env:USERPROFILE '.bashrc'
+            if ((Test-Path -LiteralPath $bashrc -PathType Leaf) -and
+                (Select-String -LiteralPath $bashrc -Pattern 'claude-accounts' -Quiet -ErrorAction SilentlyContinue)) {
+                Write-Host '  [ok] Git Bash ~/.bashrc sources the script' -ForegroundColor Green
+            } else {
+                Write-Host '  [!] Git Bash ~/.bashrc has no claude-accounts block (run install.ps1)' -ForegroundColor Yellow
+            }
+            Write-Host ''
+        }
+
         'version' {
             Write-Host "claude-accounts $script:Version (https://github.com/sppeect/claude-accounts)"
         }
@@ -543,13 +700,16 @@ function claude-account {
             Write-Host "claude-account — Claude Code account profiles (AWS CLI style) v$script:Version" -ForegroundColor Cyan
             Write-Host ''
             Write-Host '  claude-account list              list accounts and who is logged into each'
-            Write-Host '  claude-account add <name>        create an account and open the browser login'
+            Write-Host '  claude-account add <name>        create an account (inherits tools from default) and log in'
+            Write-Host '  claude-account add <name> -Minimal     inherit only settings.json (no skills/agents/content)'
             Write-Host '  claude-account add <name> -NoLogin     create without logging in (login on first run)'
             Write-Host '  claude-account remove <name> [-Force]  delete a profile (-Force when it has login data)'
             Write-Host '  claude-account use <name>        pin the account to this terminal (use default to undo)'
             Write-Host '  claude-account bind <name>       bind the current directory to an account (.claude-account)'
             Write-Host '  claude-account unbind            remove the current directory binding'
             Write-Host '  claude-account current           show the effective account and where it came from'
+            Write-Host '  claude-account migrate <name> [-From <name>]  copy tools/content from default (or -From) into a profile'
+            Write-Host '  claude-account doctor            check the install across PowerShell, cmd and Git Bash'
             Write-Host ''
             Write-Host '  claude --account <name> [...]    run Claude Code with the chosen account'
             Write-Host ''
@@ -559,4 +719,4 @@ function claude-account {
     }
 }
 
-Export-ModuleMember -Function claude, claude-account, Get-ClaudeAccounts, Resolve-ClaudeAccount
+Export-ModuleMember -Function claude, claude-account, Get-ClaudeAccounts, Resolve-ClaudeAccount, Get-ClaudeExecutable, Copy-ClaudeProfileContent

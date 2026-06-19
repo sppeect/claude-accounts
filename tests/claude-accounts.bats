@@ -670,7 +670,7 @@ make_account() {
 @test "version prints the version string" {
     run claude-account version
     [ "$status" -eq 0 ]
-    [ "$output" = "claude-accounts 1.0.0 (https://github.com/sppeect/claude-accounts)" ]
+    [ "$output" = "claude-accounts 1.1.0 (https://github.com/sppeect/claude-accounts)" ]
 }
 
 @test "help is printed when no command is given" {
@@ -678,4 +678,107 @@ make_account() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"claude-account list"* ]]
     [[ "$output" == *"Priority: --account > use (terminal) > external CLAUDE_CONFIG_DIR > .claude-account (directory) > default"* ]]
+}
+
+# ----------------------------------------------------------------------------
+# Profile inheritance (add) and migrate
+# ----------------------------------------------------------------------------
+
+# Populate the default config dir with config, tooling and a login that must
+# never be inherited.
+seed_default() {
+    mkdir -p "$CLAUDE_ACCOUNTS_DEFAULT_DIR/skills/foo" "$CLAUDE_ACCOUNTS_DEFAULT_DIR/agents"
+    printf '%s\n' '{"theme":"dark"}'                              > "$CLAUDE_ACCOUNTS_DEFAULT_DIR/settings.json"
+    printf '%s\n' '{"token":"SECRET"}'                            > "$CLAUDE_ACCOUNTS_DEFAULT_DIR/.credentials.json"
+    printf '%s\n' '{"oauthAccount":{"emailAddress":"d@x.com"}}'   > "$CLAUDE_ACCOUNTS_DEFAULT_DIR/.claude.json"
+    printf 'foo\n'                                                > "$CLAUDE_ACCOUNTS_DEFAULT_DIR/skills/foo/SKILL.md"
+    printf 'bar\n'                                                > "$CLAUDE_ACCOUNTS_DEFAULT_DIR/agents/bar.md"
+}
+
+@test "add inherits skills, agents and settings from default" {
+    seed_default
+    run claude-account add work --no-login
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Inherited from default:"* ]]
+    [ -f "$PROFILES/work/skills/foo/SKILL.md" ]
+    [ -f "$PROFILES/work/agents/bar.md" ]
+    [ -f "$PROFILES/work/settings.json" ]
+}
+
+@test "add never inherits credentials or the identity file" {
+    seed_default
+    claude-account add work --no-login > /dev/null
+    [ ! -f "$PROFILES/work/.credentials.json" ]
+    [ ! -f "$PROFILES/work/.claude.json" ]
+}
+
+@test "add --minimal copies only settings.json" {
+    seed_default
+    claude-account add lean --no-login --minimal > /dev/null
+    [ -f "$PROFILES/lean/settings.json" ]
+    [ ! -d "$PROFILES/lean/skills" ]
+    [ ! -d "$PROFILES/lean/agents" ]
+}
+
+@test "migrate copies missing tools from default (no credentials)" {
+    seed_default
+    claude-account add work --no-login --minimal > /dev/null
+    run claude-account migrate work
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Copied into 'work'"* ]]
+    [ -f "$PROFILES/work/skills/foo/SKILL.md" ]
+    [ ! -f "$PROFILES/work/.credentials.json" ]
+}
+
+@test "migrate never overwrites existing profile data" {
+    seed_default
+    mkdir -p "$PROFILES/work/skills/foo"
+    printf 'mine\n' > "$PROFILES/work/skills/foo/SKILL.md"
+    claude-account migrate work > /dev/null
+    [ "$(cat "$PROFILES/work/skills/foo/SKILL.md")" = "mine" ]
+}
+
+@test "migrate fails for an unknown destination" {
+    run claude-account migrate ghost
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"account 'ghost' does not exist"* ]]
+}
+
+@test "migrate refuses to target default" {
+    run claude-account migrate default
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"cannot migrate INTO 'default'"* ]]
+}
+
+# ----------------------------------------------------------------------------
+# doctor
+# ----------------------------------------------------------------------------
+
+@test "doctor reports paths, the account and integrations" {
+    run claude-account doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"claude-accounts doctor"* ]]
+    [[ "$output" == *"Effective account"* ]]
+    [[ "$output" == *"Shell integrations"* ]]
+}
+
+@test "doctor warns when on the default account" {
+    run claude-account doctor
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DEFAULT account"* ]]
+}
+
+# ----------------------------------------------------------------------------
+# _ca_exe skips the cmd shim dir
+# ----------------------------------------------------------------------------
+
+@test "_ca_exe skips the shim dir and finds the next claude on PATH" {
+    mkdir -p "$CLAUDE_ACCOUNTS_HOME/bin" "$TEST_TMP/realbin"
+    printf '#!/usr/bin/env bash\necho SHIM\n' > "$CLAUDE_ACCOUNTS_HOME/bin/claude"
+    chmod +x "$CLAUDE_ACCOUNTS_HOME/bin/claude"
+    printf '#!/usr/bin/env bash\necho REAL\n' > "$TEST_TMP/realbin/claude"
+    chmod +x "$TEST_TMP/realbin/claude"
+    PATH="$CLAUDE_ACCOUNTS_HOME/bin:$TEST_TMP/realbin:$PATH" run _ca_exe
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TEST_TMP/realbin/claude" ]
 }

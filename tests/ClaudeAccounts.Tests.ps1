@@ -678,7 +678,146 @@ Describe 'claude-accounts (PowerShell module)' {
         }
 
         It 'prints the version' {
-            AsText (claude-account version 6>&1) | Should -Match 'claude-accounts 1\.0\.0'
+            AsText (claude-account version 6>&1) | Should -Match 'claude-accounts 1\.1\.0'
+        }
+    }
+
+    # ========================================================================
+    Context 'profile inheritance (add)' {
+
+        BeforeEach {
+            # Populate the default config dir with a realistic mix: config,
+            # tooling and a login that must NOT be inherited.
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir 'settings.json') -Value '{"theme":"dark"}' -Encoding Ascii
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir '.credentials.json') -Value '{"token":"SECRET"}' -Encoding Ascii
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir '.claude.json') -Value '{"oauthAccount":{"emailAddress":"default@x.com"}}' -Encoding Ascii
+            New-Item -ItemType Directory -Path (Join-Path $script:DefaultDir 'skills\foo') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir 'skills\foo\SKILL.md') -Value 'foo' -Encoding Ascii
+            New-Item -ItemType Directory -Path (Join-Path $script:DefaultDir 'agents') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir 'agents\bar.md') -Value 'bar' -Encoding Ascii
+        }
+
+        AfterEach {
+            foreach ($n in 'inh', 'lean') {
+                $d = Join-Path $script:ProfilesRoot $n
+                if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            foreach ($i in 'settings.json', '.credentials.json', '.claude.json', 'skills', 'agents') {
+                $p = Join-Path $script:DefaultDir $i
+                if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
+
+        It 'inherits skills, agents and settings from default' {
+            claude-account add inh -NoLogin 6>$null
+            $d = Join-Path $script:ProfilesRoot 'inh'
+            Test-Path -LiteralPath (Join-Path $d 'skills\foo\SKILL.md') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $d 'agents\bar.md')      | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $d 'settings.json')      | Should -BeTrue
+        }
+
+        It 'never inherits credentials or the identity file' {
+            claude-account add inh -NoLogin 6>$null
+            $d = Join-Path $script:ProfilesRoot 'inh'
+            Test-Path -LiteralPath (Join-Path $d '.credentials.json') | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $d '.claude.json')      | Should -BeFalse
+        }
+
+        It '-Minimal copies only settings.json' {
+            claude-account add lean -NoLogin -Minimal 6>$null
+            $d = Join-Path $script:ProfilesRoot 'lean'
+            Test-Path -LiteralPath (Join-Path $d 'settings.json') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $d 'skills')        | Should -BeFalse
+            Test-Path -LiteralPath (Join-Path $d 'agents')        | Should -BeFalse
+        }
+    }
+
+    # ========================================================================
+    Context 'claude-account migrate' {
+
+        BeforeEach {
+            New-Item -ItemType Directory -Path (Join-Path $script:DefaultDir 'skills\foo') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir 'skills\foo\SKILL.md') -Value 'from-default' -Encoding Ascii
+            Set-Content -LiteralPath (Join-Path $script:DefaultDir '.credentials.json') -Value '{"token":"SECRET"}' -Encoding Ascii
+        }
+
+        AfterEach {
+            foreach ($i in 'skills', '.credentials.json') {
+                $p = Join-Path $script:DefaultDir $i
+                if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+            $d = Join-Path $script:ProfilesRoot 'mig'
+            if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        It 'copies missing tools from default into a profile (no credentials)' {
+            New-Item -ItemType Directory -Path (Join-Path $script:ProfilesRoot 'mig') -Force | Out-Null
+            $out = AsText (claude-account migrate mig 6>&1)
+            $out | Should -Match 'Copied into'
+            $d = Join-Path $script:ProfilesRoot 'mig'
+            Test-Path -LiteralPath (Join-Path $d 'skills\foo\SKILL.md') | Should -BeTrue
+            Test-Path -LiteralPath (Join-Path $d '.credentials.json')   | Should -BeFalse
+        }
+
+        It 'never overwrites data already in the profile' {
+            $d = Join-Path $script:ProfilesRoot 'mig'
+            New-Item -ItemType Directory -Path (Join-Path $d 'skills\foo') -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $d 'skills\foo\SKILL.md') -Value 'mine' -Encoding Ascii
+            claude-account migrate mig 6>$null
+            (Get-Content -LiteralPath (Join-Path $d 'skills\foo\SKILL.md') -Raw).Trim() | Should -Be 'mine'
+        }
+
+        It 'fails for an unknown destination' {
+            $global:LASTEXITCODE = 0
+            $err = AsText (claude-account migrate ghost 2>&1)
+            $LASTEXITCODE | Should -Be 1
+            $err | Should -Match "Account 'ghost' does not exist"
+        }
+
+        It "refuses to migrate into 'default'" {
+            $global:LASTEXITCODE = 0
+            $err = AsText (claude-account migrate default 2>&1)
+            $LASTEXITCODE | Should -Be 1
+            $err | Should -Match "Cannot migrate INTO 'default'"
+        }
+    }
+
+    # ========================================================================
+    Context 'claude-account doctor' {
+
+        It 'reports paths, the resolved account and shell integrations' {
+            $out = AsText (claude-account doctor 6>&1)
+            $out | Should -Match 'claude-accounts doctor'
+            $out | Should -Match 'Paths'
+            $out | Should -Match 'Effective account'
+            $out | Should -Match 'Shell integrations'
+        }
+
+        It 'warns when the effective account is the default' {
+            $out = AsText (claude-account doctor 6>&1)
+            $out | Should -Match 'DEFAULT account'
+        }
+    }
+
+    # ========================================================================
+    Context 'Get-ClaudeExecutable (cmd shim safety)' {
+
+        It 'skips the shim dir so the wrapper never resolves to itself' {
+            $shimDir = Join-Path $env:CLAUDE_ACCOUNTS_HOME 'bin'
+            New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path $shimDir 'claude.cmd') -Value '@echo shim' -Encoding Ascii
+            $savedPath = $env:PATH
+            try {
+                $env:PATH = "$shimDir;$env:PATH"   # shim FIRST, like a real install
+                $resolved = Get-ClaudeExecutable
+                $resolved | Should -Not -BeNullOrEmpty
+                (Split-Path -Parent $resolved).TrimEnd('\') | Should -Not -Be $shimDir.TrimEnd('\')
+                # it should land on the mock claude.cmd instead
+                (Split-Path -Parent $resolved).TrimEnd('\') | Should -Be $script:MockBin.TrimEnd('\')
+            } finally {
+                $env:PATH = $savedPath
+                Remove-Item -LiteralPath $shimDir -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 }
