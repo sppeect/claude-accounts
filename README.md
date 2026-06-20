@@ -9,10 +9,13 @@
 
 Run Claude Code with multiple accounts — `claude --account work`, `claude --account personal` — in different terminals at the same time, with per-repository defaults via a committable `.claude-account` file.
 
-Two self-contained implementations with full feature parity:
+Self-contained, with full feature parity across every shell:
 
 - `src/ClaudeAccounts.psm1` — Windows PowerShell 5.1+
-- `src/claude-accounts.sh` — bash 3.2+ / zsh (sourced from your shell rc)
+- `src/claude-accounts.sh` — bash 3.2+ / zsh (sourced from your shell rc), including Git Bash on Windows
+- `src/cmd/` — thin Command Prompt (`cmd.exe`) shims that delegate to the PowerShell module
+
+On Windows a single `install.ps1` wires up all three — PowerShell, cmd and Git Bash — so `claude --account work` behaves the same everywhere.
 
 ## The problem
 
@@ -62,19 +65,26 @@ Your existing installation is untouched: it is the `default` profile (`~/.claude
 | --- | --- |
 | `claude --account <name> [...]` | Run Claude Code with the chosen account (alias `-a`, also `--account=<name>`) |
 | `claude-account list` | List all profiles, the logged-in email of each, and mark the active one |
-| `claude-account add <name>` | Create a profile and open the browser login |
+| `claude-account add <name>` | Create a profile (inheriting tools from default) and open the browser login |
+| `claude-account add <name> --minimal` | Inherit only `settings.json` (no skills/agents/content) |
 | `claude-account add <name> --no-login` | Create without logging in (login is requested on first run) |
 | `claude-account add <name> --path <dir>` | Create a profile whose config dir lives at a custom path |
 | `claude-account remove <name> [--force]` | Delete a profile (`--force` required when it has login data) |
 | `claude-account use <name>` | Pin an account to this terminal session (`use default` to undo) |
 | `claude-account bind <name>` | Bind the current directory to an account (writes `.claude-account`) |
 | `claude-account unbind` | Remove the current directory's binding |
+| `claude-account migrate <name> [--from <name>]` | Copy tools/content from default (or `--from`) into a profile (never credentials) |
 | `claude-account current` | Show the effective account, its login, directory and which rule selected it |
+| `claude-account doctor` | Diagnose the install across PowerShell, cmd and Git Bash |
 | `claude-account version` | Print the installed version |
 
-On Windows the options are PowerShell-style switches: `-NoLogin`, `-Path <dir>`, `-Force`.
+On Windows the options are PowerShell-style switches: `-NoLogin`, `-Path <dir>`, `-Minimal`, `-From <name>`, `-Force`.
 
 The name `default` is reserved for the original installation and cannot be created or removed.
+
+### What a new profile inherits
+
+`add` copies the default account's tooling and preferences so a new profile starts ready to work: skills, agents, commands, plugins, `settings.json`, rules, output styles, themes, keybindings, plus your sessions, projects and history. It **never** copies `.credentials.json` or the identity file, so each profile logs in as its own account. Use `--minimal` to inherit only `settings.json`, and `claude-account migrate` later to pull tools into a profile you already created. Existing files in the profile are never overwritten.
 
 ## Account resolution
 
@@ -105,7 +115,8 @@ It is meant to be committed. Profile names are local labels — each teammate ru
 Claude Code officially supports the `CLAUDE_CONFIG_DIR` environment variable to relocate its config directory. `claude-accounts` builds on exactly that — no patched binary, no credential juggling:
 
 - **A profile is just a directory.** The registry is the filesystem: `~/.claude-accounts/profiles/<name>/` *is* the config dir, or a `profiles/<name>.path` file whose first line points to a custom directory (`~` is expanded; a `.path` file wins over a directory of the same name). There is no JSON registry to corrupt, and the format is identical on every OS.
-- **The environment is set only for the invocation.** The wrapper resolves the account and sets `CLAUDE_CONFIG_DIR` (plus `CLAUDE_ACCOUNT`, so hooks that call `claude` again resolve the *same* account) only for that child process — on bash via a per-invocation env prefix, on PowerShell saved and restored around the call. Nothing leaks into your shell.
+- **The environment is set only for the invocation.** The wrapper resolves the account and sets `CLAUDE_CONFIG_DIR` (plus `CLAUDE_ACCOUNT`, so hooks that call `claude` again resolve the *same* account) only for that child process — on bash via a per-invocation env prefix, on PowerShell saved and restored around the call, and on cmd via a shim that runs the same PowerShell resolution. Nothing leaks into your shell.
+- **One engine, three shells.** PowerShell uses the module directly; Git Bash sources the `.sh`; cmd.exe uses `bin\claude.cmd` / `bin\claude-account.cmd` shims that forward argv to the PowerShell module (argv and exit codes are preserved). There is a single resolution engine per OS, not one per shell.
 - **Terminals are independent.** Because nothing is global, one terminal can run `work` while another runs `personal`, simultaneously, each with its own history and sessions.
 - **Wrapper contract.** Exit codes are preserved, stdin and TTY interactivity stay intact, and argv after the first positional argument is passed through byte-for-byte.
 
@@ -113,10 +124,14 @@ Claude Code officially supports the `CLAUDE_CONFIG_DIR` environment variable to 
 
 ### Windows
 
-- Requires Windows PowerShell 5.1+ (PowerShell 7 also works).
-- In scripts, check `$LASTEXITCODE`, **not** `$?` — a wrapper function cannot propagate `$?` from a native executable in PowerShell 5.1. `$LASTEXITCODE` is preserved correctly.
-- Processes spawned outside PowerShell (npm scripts, git hooks, `Start-Process`) bypass the wrapper function. Run `claude-account use <name>` first: it exports `CLAUDE_CONFIG_DIR` for the session, and child processes inherit it.
-- An unquoted `--` is consumed by PowerShell itself before it reaches the wrapper. Quote it when you need to pass it through: `claude mcp add x '--' cmd -a token`.
+`install.ps1` configures all three Windows shells; run `claude-account doctor` to see which are wired up. Requires Windows PowerShell 5.1+ (PowerShell 7 also works).
+
+- **PowerShell** — the module defines the `claude` / `claude-account` functions directly.
+  - In scripts, check `$LASTEXITCODE`, **not** `$?` — a wrapper function cannot propagate `$?` from a native executable in PowerShell 5.1. `$LASTEXITCODE` is preserved correctly.
+  - An unquoted `--` is consumed by PowerShell itself before it reaches the wrapper. Quote it when you need to pass it through: `claude mcp add x '--' cmd -a token`.
+- **Command Prompt (`cmd.exe`)** — `bin\claude.cmd` / `bin\claude-account.cmd` shims (first on your User PATH) forward argv to the PowerShell module. There is a small per-call PowerShell start-up cost. `claude-account use` is special-cased so it still pins the account in the current cmd session.
+- **Git Bash / MSYS** — the same `claude-accounts.sh` is sourced from `~/.bashrc` and finds the native `claude.exe` automatically.
+- Processes spawned outside these shells (npm scripts, git hooks, `Start-Process`) still bypass the wrapper. Run `claude-account use <name>` first: it exports `CLAUDE_CONFIG_DIR` for the session, and child processes inherit it.
 
 ### macOS
 
@@ -131,10 +146,10 @@ Claude Code officially supports the `CLAUDE_CONFIG_DIR` environment variable to 
 
 Honest list — know what you are getting:
 
-- **Settings, plugins and MCP servers are per profile.** `add` copies `settings.json` from the default profile so new accounts inherit your permissions, theme and statusline, but that is a one-time copy at creation. Profiles drift independently afterwards; plugins and MCP registrations must be configured per profile.
+- **Profiles are independent after creation.** `add` (and `migrate`) copy the default account's tools and preferences — skills, agents, commands, plugins, settings, and your sessions/projects/history — but that is a snapshot at copy time. Profiles drift independently afterwards. The OAuth login and personal MCP servers both live in `.claude.json`, which is intentionally **not** copied (it carries identity), so MCP servers must be re-added per profile.
 - **One shared binary.** All profiles run the same Claude Code installation. Auto-update is serialized by Claude Code's own global lock, so concurrent sessions do not fight over it — but an update applies to every profile at once.
 - **`use` is per shell session.** It is an environment variable; new terminals start back at the regular resolution order. For a durable default, use `bind` (per directory) instead.
-- **The wrapper is a shell function.** Anything that invokes the `claude` binary without going through your interactive shell bypasses it (see the Windows note above — the same `claude-account use` workaround applies everywhere).
+- **The wrapper runs in your shell.** It is a shell function (PowerShell / bash) or a PATH shim (cmd). Anything that invokes the `claude` binary without going through one of these shells bypasses it (see the Windows notes above — the same `claude-account use` workaround applies everywhere).
 
 ## Comparison with alternatives
 
@@ -144,7 +159,7 @@ Honest list — know what you are getting:
 | CAAM / claude-swap | Swap files in `~/.claude` globally | Global switch: every terminal changes at once, so no two accounts in parallel |
 | claude-profiles (npm) | Profile manager for settings | Does **not** switch accounts — it manages settings profiles, not logins |
 
-`claude-accounts` is per-invocation (parallel accounts), per-directory (`.claude-account`), and works on Windows, macOS and Linux with the same commands.
+`claude-accounts` is per-invocation (parallel accounts), per-directory (`.claude-account`), and works on Windows (PowerShell, cmd and Git Bash), macOS and Linux with the same commands.
 
 ## Uninstall
 
@@ -158,8 +173,11 @@ rm -rf ~/.claude-accounts
 Windows (PowerShell):
 
 ```powershell
-# remove the Import-Module ClaudeAccounts line from your profile
-notepad $PROFILE
+# 1. remove the '# >>> claude-accounts >>>' block from your PowerShell profile
+notepad $PROFILE.CurrentUserAllHosts
+# 2. remove the same block from Git Bash, if present: %USERPROFILE%\.bashrc
+# 3. remove the shim dir from your User PATH (the entry ending in \.claude-accounts\bin)
+# 4. delete the install
 Remove-Item -Recurse -Force ~\.claude-accounts
 ```
 

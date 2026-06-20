@@ -68,3 +68,6 @@ jobs:
         run: |
           Install-Module Pester -Force -SkipPublisherCheck -MinimumVersion 5.0
           Invoke-Pester tests/ClaudeAccounts.Tests.ps1 -CI
+      - name: cmd.exe shim smoke test
+        shell: powershell
+        run: .\tests\cmd-shim-smoke.ps1
